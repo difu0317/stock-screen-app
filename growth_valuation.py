@@ -11,11 +11,20 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 import time
+import logging
 import warnings
 import traceback
 from pathlib import Path
 
 warnings.filterwarnings("ignore")
+
+# ── 后台结构化日志 ──
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger("growth_valuation")
 
 # ════════════════════════════════════════════════════════════
 # Key 持久化（~/.config/growth_valuation/config.env）
@@ -136,6 +145,44 @@ def _stock_info_xq(symbol):
     return pd.DataFrame(rows) if rows else None
 
 
+def _stock_info_sina(symbol):
+    """新浪 stock_zh_a_daily + stock_zh_a_gdhs_detail_em 组装 item/value 长表。
+    stock_zh_a_daily 提供最新收盘价和流通股；gdhs 提供总股本和股票名称。"""
+    sina_sym = _sina_symbol(symbol)
+    daily = ak.stock_zh_a_daily(symbol=sina_sym, adjust="")
+    if daily is None or daily.empty:
+        return None
+
+    last = daily.iloc[-1]
+    price = float(last["close"])
+    circulating = float(last["outstanding_share"])
+
+    rows = [
+        {"item": "最新", "value": price},
+        {"item": "流通股", "value": circulating},
+    ]
+
+    # 总股本和名称从股东户数接口取（最新一行最准确）
+    try:
+        gdhs = ak.stock_zh_a_gdhs_detail_em(symbol=symbol)
+        if gdhs is not None and not gdhs.empty:
+            latest = gdhs.iloc[-1]
+            rows.append({"item": "总股本", "value": float(latest["总股本"])})
+            if "名称" in gdhs.columns:
+                rows.append({"item": "股票简称", "value": str(latest["名称"])})
+    except Exception:
+        # 总股本缺失时用流通股代替，保证主流程不崩
+        rows.append({"item": "总股本", "value": circulating})
+
+    # 上市时间从日线最早日期推断
+    try:
+        rows.append({"item": "上市时间", "value": str(daily.iloc[0]["date"]).replace("-", "")})
+    except Exception:
+        pass
+
+    return pd.DataFrame(rows)
+
+
 def _hist_price_tx(symbol):
     df = ak.stock_zh_a_hist_tx(
         symbol=_sina_symbol(symbol),
@@ -152,25 +199,49 @@ def _hist_price_sina(symbol):
     return df.rename(columns={"date": "日期", "close": "收盘"}) if df is not None else None
 
 
-def fetch_with_fallback(key, sources, retries=2, delay=2):
-    """sources=[(source_name, fn), ...]; 按序尝试，第一个非空即返回 (df, source_name)。
-    每个源最多 retries 次。所有源失败时，把每个源的最后一次错误写入 _fetch_errors。"""
+def fetch_with_fallback(key, sources, retries=2, delay=2, timeout=15):
+    """sources=[(source_name, fn), ...]; 按序尝试，第一个非空即返回 (df, source_name, elapsed_ms, log_lines)。
+    每个源最多 retries 次，单次调用超过 timeout 秒视为超时。"""
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+    log_lines = []
     for source_name, fn in sources:
         last_err = None
         for attempt in range(1, retries + 1):
+            t0 = time.time()
             try:
-                df = fn()
+                with ThreadPoolExecutor(max_workers=1) as ex:
+                    future = ex.submit(fn)
+                    df = future.result(timeout=timeout)
+                elapsed = int((time.time() - t0) * 1000)
                 if df is not None and (not isinstance(df, pd.DataFrame) or len(df) > 0):
-                    return df, source_name
+                    rows = len(df) if hasattr(df, "__len__") else "?"
+                    msg = f"✅ {key}[{source_name}]  {rows}行  {elapsed}ms"
+                    log_lines.append(msg)
+                    logger.info(msg)
+                    return df, source_name, elapsed, log_lines
+                else:
+                    msg = f"⚠️  {key}[{source_name}] 返回空  {elapsed}ms"
+                    log_lines.append(msg)
+                    logger.warning(msg)
+            except FuturesTimeout:
+                elapsed = int((time.time() - t0) * 1000)
+                last_err = TimeoutError(f"超时 {timeout}s")
+                msg = f"❌ {key}[{source_name}] 第{attempt}次  超时>{timeout}s  {elapsed}ms"
+                log_lines.append(msg)
+                logger.error(msg)
             except Exception as e:
+                elapsed = int((time.time() - t0) * 1000)
                 last_err = e
+                msg = f"❌ {key}[{source_name}] 第{attempt}次  {type(e).__name__}: {str(e)[:80]}  {elapsed}ms"
+                log_lines.append(msg)
+                logger.error(msg)
                 if attempt < retries:
                     time.sleep(delay)
         if last_err is not None:
             errs = st.session_state.get("_fetch_errors", {})
             errs[f"{key}[{source_name}]"] = f"{type(last_err).__name__}: {last_err}"
             st.session_state["_fetch_errors"] = errs
-    return None, None
+    return None, None, 0, log_lines
 
 
 def extract_annual(df, metric, n=6):
@@ -265,6 +336,12 @@ def compute_financials(data, symbol, forecast_profit, bear, base, bull,
     cf_yearly = data["cf_yearly"]
     cf_sina = data["cf_sina"]
 
+    calc_log = []  # 供主页展示的计算步骤日志
+
+    def _clog(msg):
+        calc_log.append(msg)
+        logger.info(f"[compute] {msg}")
+
     result = {}
 
     # ── 价格 & 股本 ──
@@ -274,17 +351,21 @@ def compute_financials(data, symbol, forecast_profit, bear, base, bull,
         result["mv"] = result["price"] * result["shares"]
         result["industry"] = stock_info[stock_info["item"] == "行业"]["value"].values[0] if "行业" in stock_info["item"].values else "—"
         result["list_date"] = str(stock_info[stock_info["item"] == "上市时间"]["value"].values[0])[:4] if "上市时间" in stock_info["item"].values else "—"
+        _clog(f"价格 {result['price']:.2f}元 | 总股本 {result['shares']:.2f}亿股 | 市值 {result['mv']:.1f}亿")
     except Exception:
         result["price"] = result["shares"] = result["mv"] = 0
         result["industry"] = result["list_date"] = "—"
+        _clog("⚠️ 价格/股本读取失败，市值为0")
 
     # ── 历史净利润 ──
     raw_profit = extract_annual(fa, "归母净利润", n=6)
     result["hist_profit"] = {y: v / 1e8 for y, v in raw_profit.items()}
+    _clog(f"归母净利润：{', '.join(f'{y}={v:.2f}亿' for y, v in result['hist_profit'].items())}")
 
     # ── 历史 OCF ──
     raw_ocf = extract_annual(fa, "经营现金流量净额", n=6)
     result["hist_ocf"] = {y: v / 1e8 for y, v in raw_ocf.items()}
+    _clog(f"经营现金流：{', '.join(f'{y}={v:.2f}亿' for y, v in result['hist_ocf'].items())}")
 
     # ── 历史 Capex（四级降级）──
     hist_capex = {}
@@ -313,12 +394,14 @@ def compute_financials(data, symbol, forecast_profit, bear, base, bull,
 
     result["hist_capex"] = hist_capex
     result["capex_source"] = capex_source
+    _clog(f"Capex 来源：{capex_source}  数据年份：{list(hist_capex.keys()) or '无'}")
 
     # ── FCF = OCF - Capex ──
     result["hist_fcf"] = {
         y: max(ocf - hist_capex.get(y, 0), 0)
         for y, ocf in result["hist_ocf"].items()
     }
+    _clog(f"FCF：{', '.join(f'{y}={v:.2f}亿' for y, v in result['hist_fcf'].items())}")
 
     # ── FCF/净利润 ──
     fcf_margin = {}
@@ -328,6 +411,7 @@ def compute_financials(data, symbol, forecast_profit, bear, base, bull,
             fcf_margin[y] = result["hist_fcf"][y] / p
     result["fcf_margin"] = fcf_margin
     result["avg_fcf_margin"] = float(np.mean(list(fcf_margin.values()))) if fcf_margin else 1.0
+    _clog(f"FCF/净利润均值：{result['avg_fcf_margin']:.2f}")
 
     # ── 派生指标 ──
     hp = result["hist_profit"]
@@ -337,12 +421,15 @@ def compute_financials(data, symbol, forecast_profit, bear, base, bull,
     result["avg_cagr"] = (hv[-1] / hv[0]) ** (1 / (len(hv) - 1)) - 1 if len(hv) > 1 else 0
     result["hist_years"] = hy
     result["hist_values"] = hv
+    _clog(f"历史CAGR：{result['avg_cagr']*100:.1f}%  增速序列：{[f'{g:+.1f}%' for g in result['hist_growth']]}")
 
     mv = result["mv"]
     result["pe_ttm"] = mv / hv[-1] if hv else 0
     result["pe_2026"] = mv / forecast_profit.get(2026, hv[-1] * 1.2) if hv else 0
     result["pe_2027"] = mv / forecast_profit.get(2027, hv[-1] * 1.4) if hv else 0
     result["peg"] = result["pe_2026"] / (base * 100) if base else 0
+    _clog(f"机构预测利润：{', '.join(f'{y}E={v:.2f}亿' for y, v in forecast_profit.items())}")
+    _clog(f"PE(TTM)={result['pe_ttm']:.1f}x  2026E PE={result['pe_2026']:.1f}x  PEG={result['peg']:.2f}")
 
     # ── 反向 DCF ──
     latest_profit = hv[-1] if hv else 0
@@ -352,6 +439,7 @@ def compute_financials(data, symbol, forecast_profit, bear, base, bull,
 
     result["implied_pe"] = reverse_dcf(mv, latest_profit, terminal_pe, discount_rate, forecast_years) if latest_profit > 0 else float("nan")
     result["implied_fcf"] = reverse_dcf(mv, latest_fcf, terminal_pe, discount_rate, forecast_years) if latest_fcf > 0 else float("nan")
+    _clog(f"反向DCF隐含增速：净利润={result['implied_pe']*100:.1f}%  FCF={result['implied_fcf']*100:.1f}%")
 
     # ── 三情景 ──
     cagr_map = {"悲观": bear, "基准": base, "乐观": bull}
@@ -397,7 +485,9 @@ def compute_financials(data, symbol, forecast_profit, bear, base, bull,
     else:
         result["decision"] = "不建议买入，赔率不足"
         result["dsymbol"] = "🔴"
+    _clog(f"加权年化回报={wr*100:.1f}%  决策：{result['decision']}")
 
+    result["_calc_log"] = calc_log
     return result
 
 
@@ -419,14 +509,19 @@ def _build_model(api_key: str, grounding: bool = False):
     return {"client": client, "model": "gemini-2.5-flash", "config": config}
 
 
-def _call(model, prompt: str) -> str:
+def _call(model, prompt: str, label: str = "") -> str:
+    t0 = time.time()
+    tag = f"[AI:{label}] " if label else "[AI] "
+    logger.info(f"{tag}发送请求  model={model['model']}  prompt_len={len(prompt)}")
     try:
         resp = model["client"].models.generate_content(
             model=model["model"],
             contents=prompt,
             config=model["config"],
         )
+        elapsed = int((time.time() - t0) * 1000)
         text = resp.text
+        logger.info(f"{tag}响应完成  elapsed={elapsed}ms  output_len={len(text)}")
         try:
             chunks = resp.candidates[0].grounding_metadata.grounding_chunks
             if chunks:
@@ -435,10 +530,13 @@ def _call(model, prompt: str) -> str:
                     for c in chunks if hasattr(c, "web")
                 )
                 text += f"\n\n---\n**信息来源**\n{sources}"
+                logger.info(f"{tag}grounding chunks={len(chunks)}")
         except Exception:
             pass
         return text
     except Exception as e:
+        elapsed = int((time.time() - t0) * 1000)
+        logger.error(f"{tag}调用失败  elapsed={elapsed}ms  error={e}")
         return f"❌ 调用失败：{e}"
 
 
@@ -498,7 +596,7 @@ FCF/净利润比反映了什么？结合行业特性（重资产扩张 vs 轻资
 现在这个价位，值得买吗？
 
 ⚠️ 本分析仅供参考，不构成投资建议。"""
-    return _call(model, prompt)
+    return _call(model, prompt, label="估值解读")
 
 
 # ── 模块二：护城河与质地分析 ──
@@ -539,7 +637,7 @@ def ai_moat(api_key, stock_name, symbol, r):
 综合以上，给这家公司的生意质地打分（1-10分）并说明理由。
 
 ⚠️ 本分析基于公开信息和AI推断，仅供参考。"""
-    return _call(model, prompt)
+    return _call(model, prompt, label="护城河分析")
 
 
 # ── 模块三：近期新闻与催化剂（启用 Google Search grounding）──
@@ -574,7 +672,7 @@ def ai_news(api_key, stock_name, symbol, r):
 有没有市场可能尚未充分定价的信息？
 
 ⚠️ 新闻来自 Google Search 实时搜索，请注意核实原始来源。"""
-    return _call(model, prompt)
+    return _call(model, prompt, label="近期新闻")
 
 
 # ── 模块四：AI 建议增速（结构化输出）──
@@ -610,7 +708,7 @@ def ai_suggest_cagr(api_key, stock_name, symbol, hist_profit, hist_cagr,
   "reason": "<50字以内的中文理由，说明三个数字的依据>"
 }}"""
 
-    raw = _call(model, prompt)
+    raw = _call(model, prompt, label="AI增速建议")
     try:
         import json, re
         # 容错：提取第一个 JSON 对象
@@ -626,6 +724,46 @@ def ai_suggest_cagr(api_key, stock_name, symbol, hist_profit, hist_cagr,
     except Exception:
         pass
     return None
+
+
+# ── Web Search 兜底：当同花顺无数据时用 Gemini 搜索预测净利润 ──
+def _fetch_forecast_via_websearch(api_key: str, stock_name: str, symbol: str) -> dict:
+    """用 Gemini Google Search grounding 搜索机构盈利预测，返回 {year: 净利润亿元, '_source': '...'}"""
+    try:
+        model = _build_model(api_key, grounding=True)
+    except Exception:
+        return {}
+
+    prompt = f"""请用 Google Search 搜索 {stock_name}（A股代码{symbol}）的机构盈利预测（EPS或净利润一致预期）。
+
+## 任务
+给出2026E、2027E、2028E 的预测净利润（亿元人民币）。如果只有EPS，请同时说明总股本（亿股）以便换算。
+
+## 严格按以下 JSON 格式输出，不输出任何其他内容：
+{{
+  "2026": <净利润亿元，数字>,
+  "2027": <净利润亿元，数字>,
+  "2028": <净利润亿元，数字>,
+  "source": "<数据来源简述，如'Wind一致预期'或'同花顺盈利预测'>"
+}}"""
+
+    raw = _call(model, prompt, label="预测净利润WebSearch")
+    try:
+        import json, re
+        match = re.search(r'\{[^{}]+\}', raw, re.DOTALL)
+        if match:
+            data = json.loads(match.group())
+            result = {}
+            for yr in ["2026", "2027", "2028"]:
+                if yr in data:
+                    result[int(yr)] = float(data[yr])
+            if result:
+                result["_source"] = str(data.get("source", "Web Search"))
+                result["_inst_count"] = "web"
+                return result
+    except Exception:
+        pass
+    return {}
 
 
 # ════════════════════════════════════════════════════════════
@@ -772,11 +910,13 @@ with st.sidebar:
     if st.session_state.get("_last_symbol") != symbol:
         for key in ["ai_valuation", "ai_moat", "ai_news",
                     "cagr_reason", "bear_slider", "base_slider", "bull_slider",
-                    "_analysis_started"]:
+                    "_analysis_started",
+                    "fp_2026", "fp_2027", "fp_2028"]:
             st.session_state.pop(key, None)
-        # 清空上一只股票的数据缓存
+        # 清空上一只股票的数据缓存和自动预测值
         old_sym = st.session_state.get("_last_symbol", "")
         st.session_state.pop(f"raw_data_{old_sym}", None)
+        st.session_state.pop(f"_auto_fp_{old_sym}", None)
         st.session_state["_last_symbol"] = symbol
 
     # 股票名称：自动填充（分析后显示），也可手动修改
@@ -789,9 +929,22 @@ with st.sidebar:
     )
 
     st.subheader("📋 机构预测利润（亿元）")
-    fp_2026 = st.number_input("2026E", value=14.46, step=0.1)
-    fp_2027 = st.number_input("2027E", value=16.82, step=0.1)
-    fp_2028 = st.number_input("2028E", value=19.43, step=0.1)
+    # 在 widget 创建前把 _pending_fp_* 写入 fp_* key（同滑块处理方式）
+    for _yr in [2026, 2027, 2028]:
+        _pk = f"_pending_fp_{_yr}"
+        if _pk in st.session_state:
+            st.session_state[f"fp_{_yr}"] = st.session_state.pop(_pk)
+
+    # 自动拉取的预测值存在 _auto_fp_{symbol}，用户可在下方覆盖
+    _auto_fp = st.session_state.get(f"_auto_fp_{symbol}", {})
+    if _auto_fp:
+        st.caption(f"✅ 已自动读取（{_auto_fp.get('_source','同花顺')}，{_auto_fp.get('_inst_count','?')}家机构）")
+    else:
+        st.caption("⏳ 点击「开始分析」后自动拉取机构预测")
+
+    fp_2026 = st.number_input("2026E（可手动覆盖）", value=float(st.session_state.get("fp_2026", 0.0)), step=0.1, key="fp_2026")
+    fp_2027 = st.number_input("2027E（可手动覆盖）", value=float(st.session_state.get("fp_2027", 0.0)), step=0.1, key="fp_2027")
+    fp_2028 = st.number_input("2028E（可手动覆盖）", value=float(st.session_state.get("fp_2028", 0.0)), step=0.1, key="fp_2028")
     forecast_profit = {2026: fp_2026, 2027: fp_2027, 2028: fp_2028}
 
     st.subheader("📐 增速假设")
@@ -890,7 +1043,7 @@ if not st.session_state.get("_analysis_started"):
 | 悲观/基准/乐观 CAGR | 你对公司的增速判断 | 你的研究 |
 | 成熟期 PE | 行业参考：制造15-20，消费20-25，科技25-30 | 行业经验 |
 
-**价格/股本/历史利润/OCF/Capex 全部自动拉取，无需手动填写。**
+**价格/股本/历史利润/OCF/Capex/机构盈利预测 全部自动拉取，无需手动填写。**
     """)
     st.stop()
 
@@ -908,6 +1061,7 @@ else:
         ("实时价格与股本", "stock_info", [
             ("东财", lambda: ak.stock_individual_info_em(symbol=symbol)),
             ("雪球", lambda: _stock_info_xq(symbol)),
+            ("新浪", lambda: _stock_info_sina(symbol)),
         ]),
         ("历史股价行情", "hist_price", [
             ("东财", lambda: ak.stock_zh_a_hist(
@@ -925,23 +1079,38 @@ else:
                 stock=_sina_symbol(symbol), symbol="现金流量表",
             )),
         ]),
+        ("机构盈利预测", "profit_forecast", [
+            ("同花顺", lambda: ak.stock_profit_forecast_ths(symbol=symbol)),
+        ]),
     ]
 
+    logger.info(f"===== 开始拉取 {symbol} 数据 =====")
+    _t_total = time.time()
     st.markdown(f"#### ⏳ 正在拉取 **{symbol}** 数据...")
     _bar  = st.progress(0)
     _stat = st.empty()
+    _log_box = st.empty()
     _results = {}
     _sources = {}
+    _fetch_logs = []
 
     for i, (label, key, sources) in enumerate(_plan):
         _stat.caption(f"正在拉取：{label}...")
         _bar.progress(int((i + 0.5) / len(_plan) * 100))
-        df, src = fetch_with_fallback(key, sources)
+        df, src, elapsed_ms, lines = fetch_with_fallback(key, sources)
         _results[key] = df
         _sources[key] = src
+        _fetch_logs.extend(lines)
         _bar.progress(int((i + 1) / len(_plan) * 100))
+        _log_box.code("\n".join(_fetch_logs), language=None)
+
+    _total_ms = int((time.time() - _t_total) * 1000)
+    logger.info(f"===== 拉取完成 {symbol}  总耗时={_total_ms}ms =====")
+    _fetch_logs.append(f"─── 全部接口完成，总耗时 {_total_ms}ms ───")
+    _log_box.code("\n".join(_fetch_logs), language=None)
 
     _results["_sources"] = _sources
+    _results["_fetch_logs"] = _fetch_logs
 
     # 提取股票名称
     _results["stock_name_auto"] = ""
@@ -954,18 +1123,65 @@ else:
     except Exception:
         pass
 
+    # ── 解析机构盈利预测 → 净利润（亿元），写入 session_state 供侧边栏展示 ──
+    _fp_parsed = {}
+    try:
+        _fc_df = _results.get("profit_forecast")
+        _si_df = _results.get("stock_info")
+        if _fc_df is not None and not _fc_df.empty and _si_df is not None:
+            # 取总股本（股）
+            _shares_row = _si_df[_si_df["item"] == "总股本"]
+            _total_shares = float(_shares_row["value"].values[0]) if not _shares_row.empty else None
+            if _total_shares:
+                _inst_count = None
+                for _, _row in _fc_df.iterrows():
+                    _year = int(_row["年度"])
+                    _eps = float(_row["均值"])
+                    _fp_parsed[_year] = round(_eps * _total_shares / 1e8, 2)
+                    if _inst_count is None:
+                        _inst_count = _row.get("预测机构数", "?")
+                _fp_parsed["_source"] = _sources.get("profit_forecast", "同花顺")
+                _fp_parsed["_inst_count"] = _inst_count
+                logger.info(f"机构预测净利润：{ {y: v for y, v in _fp_parsed.items() if isinstance(y, int)} }")
+    except Exception as _e:
+        logger.warning(f"机构预测解析失败：{_e}")
+
+    # 若同花顺拉取失败，尝试用 Gemini web search 补（需要 API key）
+    if not _fp_parsed and st.session_state.get("_gemini_key_cache"):
+        try:
+            _stock_nm = _results.get("stock_name_auto") or symbol
+            _fp_parsed = _fetch_forecast_via_websearch(
+                st.session_state["_gemini_key_cache"], _stock_nm, symbol
+            )
+            if _fp_parsed:
+                logger.info(f"Web search 预测净利润：{ {y: v for y, v in _fp_parsed.items() if isinstance(y, int)} }")
+        except Exception as _e:
+            logger.warning(f"Web search 预测失败：{_e}")
+
     _stat.empty()
     _bar.empty()
+    _log_box.empty()
 
     raw_data = _results
-    st.session_state[_cache_key] = raw_data   # 存入 session 缓存
+    st.session_state[_cache_key] = raw_data   # 必须在 rerun 之前写入，否则下次重新拉取
+
+    if _fp_parsed:
+        st.session_state[f"_auto_fp_{symbol}"] = _fp_parsed
+        # widget 已实例化，不能直接写 fp_* key；存到 _pending_fp_*，下次 rerun 顶部应用
+        _need_rerun = False
+        for _yr in [2026, 2027, 2028]:
+            if _yr in _fp_parsed and st.session_state.get(f"fp_{_yr}", 0.0) == 0.0:
+                st.session_state[f"_pending_fp_{_yr}"] = _fp_parsed[_yr]
+                _need_rerun = True
+        if _need_rerun:
+            st.rerun()
 
 if raw_data["financial_abstract"] is None or raw_data["stock_info"] is None:
-    st.error(f"数据拉取失败，请检查股票代码是否正确，或稍后重试。")
-    st.markdown("**各接口状态：**")
+    st.error("数据拉取失败，请检查股票代码是否正确，或稍后重试。")
     sources = raw_data.get("_sources", {})
+    st.markdown("**各接口状态：**")
     for k, v in raw_data.items():
-        if k in ("stock_name_auto", "_sources"):
+        if k in ("stock_name_auto", "_sources", "_fetch_logs"):
             continue
         if v is None:
             st.markdown(f"- ❌ `{k}`")
@@ -980,6 +1196,10 @@ if raw_data["financial_abstract"] is None or raw_data["stock_info"] is None:
         st.markdown("**错误详情：**")
         for name, err in fetch_errors.items():
             st.code(f"{name}: {err}")
+    fetch_logs = raw_data.get("_fetch_logs", [])
+    if fetch_logs:
+        with st.expander("📋 完整拉取日志"):
+            st.code("\n".join(fetch_logs), language=None)
     st.markdown("**常见原因：**\n- 股票代码输入有误（需6位纯数字，如 `300015`）\n- 网络问题或 AKShare 接口临时故障，稍后重试\n- 部分接口需要 A 股交易时段才能访问")
     st.stop()
 
@@ -993,6 +1213,8 @@ if _auto_name_from_data:
     st.session_state["_auto_name_symbol"] = symbol
 
 # ── 计算 ──
+logger.info(f"开始计算 {symbol}")
+_t_calc = time.time()
 with st.spinner("计算中..."):
     r = compute_financials(
         raw_data, symbol, forecast_profit,
@@ -1000,6 +1222,19 @@ with st.spinner("计算中..."):
         terminal_pe, discount_rate, forecast_years,
         prob_bear, prob_base, prob_bull,
     )
+logger.info(f"计算完成 {symbol}  elapsed={int((time.time()-_t_calc)*1000)}ms")
+
+# ── 诊断日志折叠区（数据拉取 + 计算步骤）──
+_fetch_logs_display = raw_data.get("_fetch_logs", [])
+_calc_logs_display = r.get("_calc_log", [])
+if _fetch_logs_display or _calc_logs_display:
+    with st.expander("📋 诊断日志（数据拉取 & 计算步骤）", expanded=False):
+        if _fetch_logs_display:
+            st.markdown("**数据拉取**")
+            st.code("\n".join(_fetch_logs_display), language=None)
+        if _calc_logs_display:
+            st.markdown("**财务指标推导**")
+            st.code("\n".join(_calc_logs_display), language=None)
 
 # ── 顶部摘要卡片 ──
 col1, col2, col3, col4, col5 = st.columns(5)
@@ -1048,12 +1283,12 @@ with tab1:
             "项目": ["股票代码", "行业", "上市年份", "总股本"],
             "数值": [symbol, r["industry"], r["list_date"], f"{r['shares']:.2f} 亿股"],
         })
-        st.dataframe(info_df, hide_index=True, use_container_width=True)
+        st.dataframe(info_df, hide_index=True, width="stretch")
 
         st.markdown("**历史股价走势**")
         price_fig = plot_price_history(raw_data["hist_price"], stock_name)
         if price_fig:
-            st.plotly_chart(price_fig, use_container_width=True)
+            st.plotly_chart(price_fig, width="stretch")
 
     with c2:
         st.markdown("**历史财务数据（亿元）**")
@@ -1074,7 +1309,7 @@ with tab1:
                 "FCF/净利润": f"{fm:.2f}" if fm else "—",
             })
         fin_df = pd.DataFrame(fin_rows)
-        st.dataframe(fin_df, hide_index=True, use_container_width=True)
+        st.dataframe(fin_df, hide_index=True, width="stretch")
         st.caption(f"Capex 数据来源：{r['capex_source']}")
 
         # 利润 vs OCF vs FCF 趋势图
@@ -1084,7 +1319,7 @@ with tab1:
             r["hist_fcf"], r["hist_ocf"],
             bear_cagr, base_cagr, bull_cagr, forecast_years,
         )
-        st.plotly_chart(trend_fig, use_container_width=True)
+        st.plotly_chart(trend_fig, width="stretch")
 
 
 # ─────────────────────────────────────
@@ -1152,7 +1387,7 @@ with tab2:
             "折现合理市值（亿）": f"{weighted_mv:.1f}",
             "年化回报": f"{weighted_return*100:+.1f}%",
         })
-        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
         updown = (weighted_mv / r["mv"] - 1) * 100
         st.caption(f"当前市值 {r['mv']:.1f}亿 → 加权合理市值 {weighted_mv:.1f}亿（{updown:+.1f}%）")
 
@@ -1171,7 +1406,7 @@ with tab2:
             "较当前折价": f"{disc:+.1f}%",
             "": "← 当前在此区间" if abs(disc) < 5 else "",
         })
-    st.dataframe(pd.DataFrame(buy_rows), hide_index=True, use_container_width=True)
+    st.dataframe(pd.DataFrame(buy_rows), hide_index=True, width="stretch")
 
     st.divider()
     st.subheader(f"{r['dsymbol']} 综合决策")
@@ -1196,7 +1431,7 @@ with tab3:
         r["latest_profit"], cagr_range, pe_range_list,
         r["mv"], forecast_years, base_cagr, terminal_pe,
     )
-    st.plotly_chart(heatmap_fig, use_container_width=True)
+    st.plotly_chart(heatmap_fig, width="stretch")
     st.caption("绿色（>15%）= 值得买入；黄色（8-15%）= 勉强；红色（<8%）= 不划算")
 
     if r["latest_fcf"] > 0:
@@ -1205,7 +1440,7 @@ with tab3:
             r["latest_fcf"], cagr_range, pe_range_list,
             r["mv"], forecast_years, base_cagr, terminal_pe,
         )
-        st.plotly_chart(heatmap_fcf, use_container_width=True)
+        st.plotly_chart(heatmap_fcf, width="stretch")
 
 
 # ─────────────────────────────────────
